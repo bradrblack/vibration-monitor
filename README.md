@@ -1,3 +1,5 @@
+<img src="./v-sense.jpg" alt="ESP32 and ADXL345" width="800"/>
+
 # Device Monitor via Vibration
 
 Monitors a device that vibrates when it operates, such as a sump pump, washing
