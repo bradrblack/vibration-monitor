@@ -12,7 +12,7 @@
 #include "secrets.h"
 
 // Bump on each flash you want to identify later -- format: YYYY-MM-DDrN.
-#define FIRMWARE_VERSION "2026-09-20r3"
+#define FIRMWARE_VERSION "2026-09-20r9"
 
 // ---- Per-device configuration ---------------------------------------------
 // One firmware, many devices: each PlatformIO environment (see platformio.ini)
@@ -79,8 +79,19 @@ const uint16_t SAMPLES_PER_WINDOW = 100;   // 250 ms windows
 const float    BASELINE_ALPHA    = 0.2;
 
 // ---- Adafruit IO ----------------------------------------------------------
-AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
-AdafruitIO_Feed *eventFeed = io.feed(EVENT_FEED);
+// Events are JSON, ~100 bytes. AdafruitIO_Feed::save() can't carry that: it copies
+// the value with an unchecked strcpy into a 45-byte buffer (AIO_DATA_LENGTH) and
+// wraps it in a CSV row, so the message is garbage and Adafruit IO drops it while
+// save() still reports success. Publish through the underlying MQTT client
+// instead, which needs this subclass to reach the protected _mqtt member.
+class AioWiFi : public AdafruitIO_WiFi {
+ public:
+  using AdafruitIO_WiFi::AdafruitIO_WiFi;
+  Adafruit_MQTT *mqtt() { return _mqtt; }
+};
+AioWiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
+// The /feeds/ topic (unlike the /f/ one the library uses) parses a JSON payload.
+Adafruit_MQTT_Publish eventPub(io.mqtt(), IO_USERNAME "/feeds/" EVENT_FEED);
 // Free Adafruit IO accounts are rate limited (and shared by every device on the
 // account), and events should be rare: publish at most one event per minute.
 // Events queue up in the meantime, each stamped with when it really happened.
@@ -367,6 +378,39 @@ void i2cBusRecover() {
   digitalWrite(SDA_PIN, HIGH); delayMicroseconds(10);
 }
 
+// Diagnostic for a missing sensor: logs the level of each line at rest (both
+// should idle HIGH via pull-ups; SDA or SCL stuck LOW means a short or a wedged
+// device) and every address that ACKs. The ADXL345 answers at 0x53 (ALT ADDRESS
+// pin low) or 0x1D (high); nothing at all usually means no power, CS not tied
+// high (that selects SPI mode) or SDA/SCL swapped.
+void i2cScanLog() {
+  logf("[I2C] idle levels: SDA=%d SCL=%d", digitalRead(SDA_PIN), digitalRead(SCL_PIN));
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      logf("[I2C] device ACKs at 0x%02X", addr);
+      found++;
+    }
+  }
+  if (!found) logf("[I2C] scan found no devices");
+}
+
+// accel.begin() often fails on its first call after the bus has been idle
+// (it re-runs Wire.begin(), and the first transfer then fails with
+// ESP_ERR_INVALID_STATE) yet succeeds when repeated straight away, even though
+// the sensor is wired correctly. So retry a few times before giving up.
+bool beginAccel() {
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    if (accel.begin()) {
+      if (attempt > 1) logf("[I2C] ADXL345 detected on attempt %d", attempt);
+      return true;
+    }
+    delay(50);
+  }
+  return false;
+}
+
 // Waits for the ADXL345 at boot. If it's missing: keep retrying, push a
 // notification after a minute (so a dead sensor isn't silent), and reboot after
 // 30 minutes as a last resort (the reason is pushed on the next boot).
@@ -376,8 +420,9 @@ void setupSensor() {
 
   uint32_t start = millis();
   bool notified = false;
-  while (!accel.begin()) {
+  while (!beginAccel()) {
     logf("[I2C] ADXL345 not detected at boot -- check wiring (SDA=%d SCL=%d)", SDA_PIN, SCL_PIN);
+    i2cScanLog();
     uint32_t waited = millis() - start;
     if (!notified && waited >= SENSOR_NOTIFY_AFTER_MS) {
       notified = true;
@@ -439,6 +484,18 @@ void buildEventJson(const DeviceEvent &e, char *buf, size_t len) {
   if (e.at[0] && n < (int)len)        n += snprintf(buf + n, len - n, ",\"at\":\"%s\"", e.at);
   if (e.note && n < (int)len)         n += snprintf(buf + n, len - n, ",\"note\":\"%s\"", e.note);
   if (n < (int)len)                   snprintf(buf + n, len - n, "}");
+}
+
+// Adafruit IO treats a JSON-object payload as a data record and silently drops
+// it unless it has a "value" key, so send the event JSON as a string in "value":
+// {"value":"{\"device\":\"pump\",...}"}. The stored feed value is the event JSON.
+void wrapForAio(const char *json, char *buf, size_t len) {
+  size_t n = snprintf(buf, len, "{\"value\":\"");
+  for (const char *p = json; *p && n + 4 < len; p++) {
+    if (*p == '"' || *p == '\\') buf[n++] = '\\';
+    buf[n++] = *p;
+  }
+  snprintf(buf + n, len - n, "\"}");
 }
 
 void setRunState(bool running, uint32_t eventMs) {
@@ -585,7 +642,9 @@ void serviceNetwork(uint32_t now) {
     lastAttemptMs = now;
     char json[160];
     buildEventJson(eventQueue[0], json, sizeof(json));
-    if (eventFeed->save(json)) {
+    char payload[288];
+    wrapForAio(json, payload, sizeof(payload));
+    if (eventPub.publish(payload)) {
       logf("Published to Adafruit IO: %s", json);
       lastPublishedState = eventQueue[0].start ? 1 : 0;
       saveLastPublishedState(lastPublishedState);
