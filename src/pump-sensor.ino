@@ -12,7 +12,15 @@
 #include "secrets.h"
 
 // Bump on each flash you want to identify later -- format: YYYY-MM-DDrN.
-#define FIRMWARE_VERSION "2026-09-19r1"
+#define FIRMWARE_VERSION "2026-09-20r1"
+
+const char *BANNER =
+R"(__     ___ _               _   _               ____
+   \ \   / (_) |__  _ __ __ _| |_(_) ___  _ __   / ___|  ___ _ __  ___  ___
+    \ \ / /| | '_ \| '__/ _` | __| |/ _ \| '_ \  \___ \ / _ \ '_ \/ __|/ _ \
+     \ V / | | |_) | | | (_| | |_| | (_) | | | |  ___) |  __/ | | \__ \  __/
+      \_/  |_|_.__/|_|  \__,_|\__|_|\___/|_| |_| |____/ \___|_| |_|___/\___|
+                                                                            )";
 
 // ---- Pins -----------------------------------------------------------------
 const int SDA_PIN = 5;
@@ -594,6 +602,9 @@ void setup(void) {
   // Set the timezone before any logging: the RTC survives a soft reset, so
   // time() can already be valid at boot and would otherwise be read as UTC.
   configTzTime(TZ_STRING, NTP_SERVER);
+
+  Serial.println(BANNER);
+  Serial.println();
 
   logf("--- Pump sensor v%s ---", FIRMWARE_VERSION);
 
