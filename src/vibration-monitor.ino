@@ -12,7 +12,43 @@
 #include "secrets.h"
 
 // Bump on each flash you want to identify later -- format: YYYY-MM-DDrN.
-#define FIRMWARE_VERSION "2026-09-20r1"
+#define FIRMWARE_VERSION "2026-09-20r3"
+
+// ---- Per-device configuration ---------------------------------------------
+// One firmware, many devices: each PlatformIO environment (see platformio.ini)
+// sets DEVICE_NAME plus whatever tuning that machine needs via build flags.
+// DEVICE_NAME appears in every Adafruit IO event and ntfy message; keep it to
+// plain characters (no quotes or backslashes) since it goes into JSON as-is.
+#ifndef DEVICE_NAME
+#error "DEVICE_NAME is not set. Build a device environment, e.g. `pio run -e pump` (see platformio.ini)."
+#endif
+
+// Vibration thresholds (m/s^2 RMS): above ON_RMS_THRESHOLD = vibrating, below
+// OFF_RMS_THRESHOLD = quiet, with the band in between as hysteresis.
+#ifndef ON_RMS_THRESHOLD
+#define ON_RMS_THRESHOLD 0.40f
+#endif
+#ifndef OFF_RMS_THRESHOLD
+#define OFF_RMS_THRESHOLD 0.20f
+#endif
+// A run starts after RUN_CONFIRM_MS of continuous vibration and ends after
+// STOP_CONFIRM_MS of continuous quiet. Machines with pauses inside a cycle
+// (a washer filling/soaking/draining) need a long STOP_CONFIRM_MS so one cycle
+// isn't reported as several.
+#ifndef RUN_CONFIRM_MS
+#define RUN_CONFIRM_MS 3000UL
+#endif
+#ifndef STOP_CONFIRM_MS
+#define STOP_CONFIRM_MS 3000UL
+#endif
+
+// Adafruit IO feed shared by all devices. Every event says which device it is.
+#ifndef EVENT_FEED
+#define EVENT_FEED "appliance-events"
+#endif
+
+// NVS (flash) namespace for persisted state.
+#define NVS_NS "devmon"
 
 const char *BANNER =
 R"(__     ___ _               _   _               ____
@@ -28,14 +64,13 @@ const int SCL_PIN = 6;   // GPIO 8/9 are LED/boot pins on this board
 
 const int  LED_PIN        = 8;
 const bool LED_ACTIVE_LOW = true;  // set false if the LED lights when the pin is HIGH
-const uint32_t LED_BLINK_HALF_PERIOD_MS = 500;  // blink rate while pump is ON
+const uint32_t LED_BLINK_HALF_PERIOD_MS = 500;  // blink rate while the device is running
 
 // ---- Vibration detection --------------------------------------------------
 // Samples are high-passed against a slow per-axis baseline (removes gravity and
 // mounting angle), then RMS'd over a short window. Tune the thresholds from the
-// "rms=" values printed over serial while the pump is idle and running.
-const float ON_RMS_THRESHOLD  = 0.40;  // m/s^2 RMS: above this = vibrating
-const float OFF_RMS_THRESHOLD = 0.20;  // m/s^2 RMS: below this = quiet (hysteresis)
+// "rms=" values printed over serial while the device is idle and running.
+// (ON_RMS_THRESHOLD / OFF_RMS_THRESHOLD are set per device, see above.)
 
 const uint32_t SAMPLE_PERIOD_US  = 2500;   // 400 Hz, matches accel data rate
 const uint16_t SAMPLES_PER_WINDOW = 100;   // 250 ms windows
@@ -43,24 +78,20 @@ const uint16_t SAMPLES_PER_WINDOW = 100;   // 250 ms windows
 // (<10 Hz) while passing motor vibration (~29-58 Hz for 1725/3450 RPM).
 const float    BASELINE_ALPHA    = 0.2;
 
-// Pump state is debounced so a bump on the pipe isn't counted as a run.
-const uint32_t RUN_CONFIRM_MS  = 3000;  // continuously vibrating this long => pump running
-const uint32_t STOP_CONFIRM_MS = 3000;  // quiet this long => pump stopped
-
 // ---- Adafruit IO ----------------------------------------------------------
 AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
-AdafruitIO_Feed *pumpFeed = io.feed("pump");
-AdafruitIO_Feed *runSecondsFeed = io.feed("pump-run-seconds");
-// Free Adafruit IO accounts are rate limited, and state changes should be rare:
-// send at most one update per minute, and only if the state really differs from
-// what the feed already shows.
+AdafruitIO_Feed *eventFeed = io.feed(EVENT_FEED);
+// Free Adafruit IO accounts are rate limited (and shared by every device on the
+// account), and events should be rare: publish at most one event per minute.
+// Events queue up in the meantime, each stamped with when it really happened.
 const uint32_t MIN_PUBLISH_INTERVAL_MS = 60000;
 const uint32_t PUBLISH_RETRY_MS = 10000;
 
 // ---- Reliability ----------------------------------------------------------
-// Many ESP32-C3 mini boards have a marginal antenna design and fail to join at
-// full TX power; reducing it is the usual fix.
-const wifi_power_t WIFI_TX_POWER = WIFI_POWER_8_5dBm;
+// Many ESP32-C3 mini boards have a marginal antenna/regulator design and fail to
+// join at full TX power (~19.5 dBm); capping it is the usual fix. Drop to
+// WIFI_POWER_8_5dBm if joins are flaky at this level.
+const wifi_power_t WIFI_TX_POWER = WIFI_POWER_15dBm;
 const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;   // at boot: reboot if no WiFi by then
 const uint32_t WIFI_RETRY_MS           = 30000;   // reset the radio and retry this often
 const uint32_t WIFI_DOWN_REBOOT_MS     = 120000;  // running: reboot if WiFi down this long
@@ -69,7 +100,7 @@ const uint32_t WIFI_DOWN_REBOOT_MS     = 120000;  // running: reboot if WiFi dow
 const uint32_t AIO_DOWN_REBOOT_MS      = 600000;  // 10 min
 
 // The ADXL345 is polled for its fixed device ID; a wedged or unplugged I2C
-// bus otherwise just produces a stream of zeros (looks like a quiet pump).
+// bus otherwise just produces a stream of zeros (looks like a quiet device).
 const uint32_t SENSOR_CHECK_INTERVAL_MS = 30000;
 const int      SENSOR_FAIL_LIMIT        = 3;       // consecutive failed checks => reboot
 const uint32_t SENSOR_BOOT_RETRY_MS     = 5000;    // at boot: retry detection this often
@@ -84,21 +115,23 @@ const uint8_t  ADXL345_DEVICE_ID        = 0xE5;
 #define REBOOT_HOUR 3
 const char *NTP_SERVER = "pool.ntp.org";
 // The daily reboot is routine, but a push each night doubles as a heartbeat
-// for a device that's supposed to be watching over a sump pump. Set false to
+// for an unattended monitoring device. Set false to
 // only be notified of exception reboots.
 #define NOTIFY_DAILY_REBOOT true
 #define REASON_DAILY_REBOOT "Daily scheduled reboot"
 
-// Also push pump ON/OFF events to ntfy (for initial testing / as a second
-// channel). Same rules as the Adafruit IO feed: at most one per minute, and only
-// if the state differs from the last one sent. Requires NTFY_TOPIC.
-#define NOTIFY_PUMP_STATE true
-#if NOTIFY_PUMP_STATE && defined(NTFY_TOPIC)
-#define PUMP_NTFY
+// Also push started/stopped events to ntfy (for initial testing / as a second
+// channel). At most one per minute, and only if the state differs from the last
+// one pushed (so a start and stop inside a minute sends nothing). Requires
+// NTFY_TOPIC.
+#define NOTIFY_RUN_STATE true
+#if NOTIFY_RUN_STATE && defined(NTFY_TOPIC)
+#define RUN_NTFY
 #endif
 
-// If the board was restarted while the feed last showed "running", correct it
-// once the pump has been observed for this long and is really idle.
+// If the board was restarted while the feed's last event for this device was a
+// "start", correct it once the device has been observed for this long and is
+// really idle.
 const uint32_t BOOT_SETTLE_MS = 15000;
 
 Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
@@ -110,7 +143,7 @@ uint16_t sampleCount = 0;
 uint32_t nextSampleUs = 0;
 
 bool ledOn = false;            // instantaneous vibration indicator
-bool pumpRunning = false;
+bool deviceRunning = false;
 uint32_t aboveSince = 0;       // 0 = not currently above ON threshold
 uint32_t belowSince = 0;       // 0 = not currently below OFF threshold
 uint32_t runStartMs = 0;
@@ -121,22 +154,30 @@ bool aioUp = false;
 uint32_t lastWifiAttempt = 0;
 uint32_t wifiDownSince = 0;    // 0 = WiFi currently up
 uint32_t aioDownSince = 0;     // 0 = Adafruit IO currently up (or WiFi down)
-int pendingPublish = -1;       // -1 none, else 0/1 waiting to be sent
-int lastPublishedState = -1;   // what the feed currently shows (-1 = unknown); persisted in NVS
+int lastPublishedState = -1;   // last event published for this device: 1 start, 0 stop, -1 unknown; persisted in NVS
 // Initialised so the first publish after boot isn't held back by the rate limit.
 uint32_t lastPublishMs = (uint32_t)(0 - MIN_PUBLISH_INTERVAL_MS);
 uint32_t lastAttemptMs = 0;
-float pendingRunSeconds = -1;  // <0 none, else duration of a finished run waiting to be sent
-uint32_t lastRunAttemptMs = 0;
 uint32_t lastStatusMs = 0;
 float lastRms = 0;
 
-int pendingNtfy = -1;          // -1 none, else 0/1 pump state waiting to be pushed
+int pendingNtfy = -1;          // -1 none, else 0/1 state waiting to be pushed
 int lastNtfyState = -1;
 uint32_t lastNtfyMs = (uint32_t)(0 - MIN_PUBLISH_INTERVAL_MS);
 uint32_t lastNtfyAttemptMs = 0;
-float ntfyRunSeconds = 0;      // length of the run that ended (for the OFF message)
+float ntfyRunSeconds = 0;      // length of the run that ended (for the stopped message)
 char ntfyEventTime[32] = "";   // when the pending state change happened
+
+// Events waiting to be published to Adafruit IO, oldest first.
+struct DeviceEvent {
+  bool start;                  // true = started, false = stopped
+  float seconds;               // run length, stop events only (<0 = unknown)
+  char at[32];                 // when it happened (ISO 8601), empty if the clock wasn't synced
+  const char *note;            // optional, e.g. "restart" for a corrected stale state
+};
+const int EVENT_QUEUE_SIZE = 8;
+DeviceEvent eventQueue[EVENT_QUEUE_SIZE];
+int eventCount = 0;
 
 int lastRebootDay = -1;        // persisted in NVS so the daily reboot fires once, not in a loop
 int sensorFails = 0;
@@ -170,6 +211,19 @@ void logf(const char *fmt, ...) {
   Serial.printf("[%s] %s\r\n", logTimestamp(), msg);
 }
 
+// Formats when an event happened. State changes are confirmed after a debounce
+// delay, so ageMs (how long ago it really started/stopped) is subtracted.
+// Leaves the buffer empty if the clock hasn't synced.
+void formatEventTime(char *buf, size_t len, uint32_t ageMs, const char *fmt) {
+  buf[0] = 0;
+  time_t now = time(nullptr);
+  if (now < 100000) return;
+  time_t t = now - (time_t)(ageMs / 1000);
+  struct tm timeinfo;
+  localtime_r(&t, &timeinfo);
+  strftime(buf, len, fmt, &timeinfo);
+}
+
 // ==========================================
 // Reboot reporting (ntfy.sh)
 // ==========================================
@@ -179,8 +233,14 @@ void logf(const char *fmt, ...) {
 // it stays quiet. Define NTFY_TOPIC in secrets.h to enable pushes.
 Preferences prefs;
 
+// Reads the recorded reboot reason ("" if none), without the driver logging an
+// error for a key that was never written.
+String readRebootReason() {
+  return prefs.isKey("last_reason") ? prefs.getString("last_reason", "") : String("");
+}
+
 void recordRebootReason(const char *reason) {
-  prefs.begin("pumpctl", false);
+  prefs.begin(NVS_NS, false);
   prefs.putString("last_reason", reason);
   // The daily reboot isn't a symptom of anything -- only count exception
   // reboots, so "reboot #N" means something went wrong N times.
@@ -202,8 +262,8 @@ void restartWithReason(const char *reason) {
 // happen before our code runs, so without this they're invisible. Must run
 // before anything else in setup() can record a reason for this boot.
 void checkUnexpectedReset() {
-  prefs.begin("pumpctl", true);
-  String reason = prefs.getString("last_reason", "");
+  prefs.begin(NVS_NS, false);
+  String reason = readRebootReason();
   prefs.end();
   if (reason.length() > 0) return; // a deliberate reboot already recorded this
 
@@ -252,8 +312,8 @@ bool sendNtfy(const String &title, const String &message) {
 }
 
 void notifyLastReboot() {
-  prefs.begin("pumpctl", false);
-  String reason = prefs.getString("last_reason", "");
+  prefs.begin(NVS_NS, false);
+  String reason = readRebootReason();
   uint32_t count = prefs.getUInt("reboot_count", 0);
   if (reason.length() > 0) {
     prefs.putString("last_reason", ""); // clear so a normal boot stays quiet
@@ -263,12 +323,12 @@ void notifyLastReboot() {
   if (reason.length() == 0) return;
   if (!NOTIFY_DAILY_REBOOT && reason == REASON_DAILY_REBOOT) return;
 
-  sendNtfy("Pump sensor rebooted",
+  sendNtfy(String(DEVICE_NAME) + " rebooted",
            reason + " (reboot #" + String(count) + ") at " + logTimestamp());
 }
 
 void saveLastPublishedState(int state) {
-  prefs.begin("pumpctl", false);
+  prefs.begin(NVS_NS, false);
   prefs.putInt("last_state", state);
   prefs.end();
 }
@@ -321,7 +381,7 @@ void setupSensor() {
     uint32_t waited = millis() - start;
     if (!notified && waited >= SENSOR_NOTIFY_AFTER_MS) {
       notified = true;
-      sendNtfy("Pump sensor: accelerometer missing",
+      sendNtfy(String(DEVICE_NAME) + ": accelerometer missing",
                String("ADXL345 not responding on I2C since boot at ") + logTimestamp());
     }
     if (waited >= SENSOR_BOOT_REBOOT_MS) {
@@ -337,7 +397,7 @@ void setupSensor() {
 
 // Periodically confirms the ADXL345 still answers over I2C. Without this a
 // disconnected/wedged sensor reads as zeros and looks like a permanently
-// quiet pump.
+// quiet device.
 void checkSensorWatchdog() {
   uint32_t now = millis();
   if (now - lastSensorCheck < SENSOR_CHECK_INTERVAL_MS) return;
@@ -355,26 +415,52 @@ void checkSensorWatchdog() {
 }
 
 // ==========================================
-// Pump state
+// Run state and events
 // ==========================================
-void setPumpState(bool running, uint32_t eventMs) {
-  pumpRunning = running;
+// Appends an event to the publish queue (oldest dropped if it's ever full).
+void enqueueEvent(bool start, float seconds, uint32_t ageMs, const char *note = nullptr) {
+  if (eventCount == EVENT_QUEUE_SIZE) {
+    logf("Event queue full, dropping oldest event");
+    memmove(&eventQueue[0], &eventQueue[1], sizeof(DeviceEvent) * (EVENT_QUEUE_SIZE - 1));
+    eventCount--;
+  }
+  DeviceEvent &e = eventQueue[eventCount++];
+  e.start = start;
+  e.seconds = seconds;
+  e.note = note;
+  formatEventTime(e.at, sizeof(e.at), ageMs, "%Y-%m-%dT%H:%M:%S%z");
+}
+
+// e.g. {"device":"washer","event":"stop","seconds":2820.4,"at":"2026-09-20T09:12:01-0400"}
+void buildEventJson(const DeviceEvent &e, char *buf, size_t len) {
+  int n = snprintf(buf, len, "{\"device\":\"%s\",\"event\":\"%s\"", DEVICE_NAME,
+                   e.start ? "start" : "stop");
+  if (e.seconds >= 0 && n < (int)len) n += snprintf(buf + n, len - n, ",\"seconds\":%.1f", e.seconds);
+  if (e.at[0] && n < (int)len)        n += snprintf(buf + n, len - n, ",\"at\":\"%s\"", e.at);
+  if (e.note && n < (int)len)         n += snprintf(buf + n, len - n, ",\"note\":\"%s\"", e.note);
+  if (n < (int)len)                   snprintf(buf + n, len - n, "}");
+}
+
+void setRunState(bool running, uint32_t eventMs) {
+  deviceRunning = running;
+  uint32_t ageMs = millis() - eventMs;
+  float seconds = -1;
   if (running) {
     runStartMs = eventMs;
-    logf("PUMP ON");
+    logf("%s STARTED", DEVICE_NAME);
   } else {
     uint32_t dur = eventMs - runStartMs;
     cycleCount++;
     totalRunMs += dur;
-    logf("PUMP OFF - ran %.1f s (cycle %lu, total run %.1f s)",
-         dur / 1000.0, (unsigned long)cycleCount, totalRunMs / 1000.0);
-    pendingRunSeconds = dur / 1000.0f;
-    ntfyRunSeconds = dur / 1000.0f;
+    seconds = dur / 1000.0f;
+    logf("%s STOPPED - ran %.1f s (cycle %lu, total run %.1f s)", DEVICE_NAME,
+         seconds, (unsigned long)cycleCount, totalRunMs / 1000.0);
+    ntfyRunSeconds = seconds;
   }
-  pendingPublish = running ? 1 : 0;
-#ifdef PUMP_NTFY
+  enqueueEvent(running, seconds, ageMs);
+#ifdef RUN_NTFY
   pendingNtfy = running ? 1 : 0;
-  strlcpy(ntfyEventTime, logTimestamp(), sizeof(ntfyEventTime));
+  formatEventTime(ntfyEventTime, sizeof(ntfyEventTime), ageMs, "%Y-%m-%d %H:%M:%S %Z");
 #endif
 }
 
@@ -390,14 +476,14 @@ void processWindow(float rms, uint32_t now) {
   if (rms > ON_RMS_THRESHOLD) {
     if (!aboveSince) aboveSince = now;
     belowSince = 0;
-    if (!pumpRunning && now - aboveSince >= RUN_CONFIRM_MS) {
-      setPumpState(true, aboveSince);
+    if (!deviceRunning && now - aboveSince >= RUN_CONFIRM_MS) {
+      setRunState(true, aboveSince);
     }
   } else if (rms < OFF_RMS_THRESHOLD) {
     if (!belowSince) belowSince = now;
     aboveSince = 0;
-    if (pumpRunning && now - belowSince >= STOP_CONFIRM_MS) {
-      setPumpState(false, belowSince);
+    if (deviceRunning && now - belowSince >= STOP_CONFIRM_MS) {
+      setRunState(false, belowSince);
     }
   } else {
     // Hysteresis band: neither counts toward starting a run (footsteps are
@@ -406,21 +492,22 @@ void processWindow(float rms, uint32_t now) {
     belowSince = 0;
   }
 
-  // LED: blinks while the pump is considered ON; otherwise solid while any
+  // LED: blinks while the device is considered running; otherwise solid while any
   // vibration is detected, and fully off when quiet.
-  if (pumpRunning) setLed((now / LED_BLINK_HALF_PERIOD_MS) % 2 == 0);
+  if (deviceRunning) setLed((now / LED_BLINK_HALF_PERIOD_MS) % 2 == 0);
   else setLed(ledOn);
 }
 
-// If we restarted (crash, watchdog, nightly reboot...) while the feed last
-// showed "running", it would stay stuck on "running" until the next real cycle.
-// After a short settle time, if the pump is really idle, correct it.
+// If we restarted (crash, watchdog, nightly reboot...) while this device's last
+// published event was a "start", the feed would keep implying it's running until
+// its next real run. After a short settle time, if it's really idle, publish a
+// stop (marked as a restart correction, with no run length).
 void checkBootStateCorrection(uint32_t now) {
   if (bootCorrectionDone || now < BOOT_SETTLE_MS) return;
   bootCorrectionDone = true;
-  if (lastPublishedState == 1 && !pumpRunning && pendingPublish < 0) {
-    logf("Feed showed pump running before restart but it is idle; correcting");
-    pendingPublish = 0;
+  if (lastPublishedState == 1 && !deviceRunning && eventCount == 0) {
+    logf("Last event was a start but the device is idle after a restart; correcting");
+    enqueueEvent(false, -1, 0, "restart");
   }
 }
 
@@ -493,24 +580,22 @@ void serviceNetwork(uint32_t now) {
 
   bool retryOk = lastAttemptMs == 0 || now - lastAttemptMs >= PUBLISH_RETRY_MS;
 
-  if (pendingPublish == lastPublishedState) {
-    pendingPublish = -1;  // state flipped back before it was sent: nothing to report
-  }
-  if (pendingPublish >= 0) {
-    bool rateOk = now - lastPublishMs >= MIN_PUBLISH_INTERVAL_MS;
-    if (aioUp && rateOk && retryOk) {
-      lastAttemptMs = now;
-      if (pumpFeed->save(pendingPublish)) {
-        logf("Published pump=%d to Adafruit IO", pendingPublish);
-        lastPublishedState = pendingPublish;
-        saveLastPublishedState(lastPublishedState);
-        lastPublishMs = now;
-        pendingPublish = -1;
-      }
+  // Publish the oldest queued event, at most one per MIN_PUBLISH_INTERVAL_MS.
+  if (eventCount > 0 && aioUp && retryOk && now - lastPublishMs >= MIN_PUBLISH_INTERVAL_MS) {
+    lastAttemptMs = now;
+    char json[160];
+    buildEventJson(eventQueue[0], json, sizeof(json));
+    if (eventFeed->save(json)) {
+      logf("Published to Adafruit IO: %s", json);
+      lastPublishedState = eventQueue[0].start ? 1 : 0;
+      saveLastPublishedState(lastPublishedState);
+      lastPublishMs = now;
+      memmove(&eventQueue[0], &eventQueue[1], sizeof(DeviceEvent) * (EVENT_QUEUE_SIZE - 1));
+      eventCount--;
     }
   }
 
-#ifdef PUMP_NTFY
+#ifdef RUN_NTFY
   if (pendingNtfy == lastNtfyState) {
     pendingNtfy = -1;  // flipped back before it was sent: nothing to report
   }
@@ -519,8 +604,8 @@ void serviceNetwork(uint32_t now) {
     lastNtfyAttemptMs = now;
     // Blocks for the HTTPS request (~1 s); rare, and sampling just resumes.
     bool ok = pendingNtfy == 1
-        ? sendNtfy("Pump ON", String("Pump started at ") + ntfyEventTime)
-        : sendNtfy("Pump OFF", String("Pump stopped at ") + ntfyEventTime +
+        ? sendNtfy(String(DEVICE_NAME) + " started", String("Started at ") + ntfyEventTime)
+        : sendNtfy(String(DEVICE_NAME) + " stopped", String("Stopped at ") + ntfyEventTime +
                    " (ran " + String(ntfyRunSeconds, 1) + " s)");
     if (ok) {
       lastNtfyState = pendingNtfy;
@@ -529,17 +614,6 @@ void serviceNetwork(uint32_t now) {
     }
   }
 #endif
-
-  // Exact run length measured on the device (the state feed's timestamps can lag
-  // by up to a minute because of the rate limit above).
-  if (pendingRunSeconds >= 0 && aioUp &&
-      (lastRunAttemptMs == 0 || now - lastRunAttemptMs >= PUBLISH_RETRY_MS)) {
-    lastRunAttemptMs = now;
-    if (runSecondsFeed->save(pendingRunSeconds, 0, 0, 0, 1)) {
-      logf("Published pump-run-seconds=%.1f to Adafruit IO", pendingRunSeconds);
-      pendingRunSeconds = -1;
-    }
-  }
 }
 
 // Reboots if WiFi has stayed down too long; auto-reconnect and the retry in
@@ -570,7 +644,7 @@ void checkAioWatchdog() {
 }
 
 // Reboots once per day at REBOOT_HOUR local time (see TZ_STRING). Held off
-// while the pump is running or a report is still waiting to be sent, so it
+// while the device is running or a report is still waiting to be sent, so it
 // never drops a run in progress; the whole REBOOT_HOUR hour is the window.
 void checkDailyReboot() {
   time_t now = time(nullptr);
@@ -579,13 +653,13 @@ void checkDailyReboot() {
   struct tm timeinfo;
   localtime_r(&now, &timeinfo);
   if (timeinfo.tm_hour != REBOOT_HOUR || timeinfo.tm_mday == lastRebootDay) return;
-  if (pumpRunning || pendingPublish >= 0 || pendingRunSeconds >= 0 || pendingNtfy >= 0) return;
+  if (deviceRunning || eventCount > 0 || pendingNtfy >= 0) return;
 
   lastRebootDay = timeinfo.tm_mday;
   // Persisted, not just RAM: otherwise the reboot this triggers would see "not
   // rebooted today" again on the next boot (still inside the same hour) and
   // loop for the rest of the hour.
-  prefs.begin("pumpctl", false);
+  prefs.begin(NVS_NS, false);
   prefs.putInt("last_reboot_day", lastRebootDay);
   prefs.end();
   restartWithReason(REASON_DAILY_REBOOT);
@@ -606,9 +680,11 @@ void setup(void) {
   Serial.println(BANNER);
   Serial.println();
 
-  logf("--- Pump sensor v%s ---", FIRMWARE_VERSION);
+  logf("--- %s monitor v%s ---", DEVICE_NAME, FIRMWARE_VERSION);
 
-  prefs.begin("pumpctl", true);
+  // Opened read-write so the namespace is created on a brand-new device (a
+  // read-only open of a missing namespace logs an error on first boot).
+  prefs.begin(NVS_NS, false);
   lastRebootDay = prefs.getInt("last_reboot_day", -1);
   lastPublishedState = prefs.getInt("last_state", -1);
   prefs.end();
@@ -623,7 +699,7 @@ void setup(void) {
   notifyLastReboot();
   setupSensor();
 
-  logf("Monitoring pump vibration...");
+  logf("Monitoring %s vibration...", DEVICE_NAME);
   nextSampleUs = micros();
 }
 
@@ -661,7 +737,7 @@ void loop(void) {
   if (now - lastStatusMs >= 1000) {
     lastStatusMs = now;
     logf("rms=%.3f state=%s wifi=%s aio=%s", lastRms,
-         pumpRunning ? "RUNNING" : "idle",
+         deviceRunning ? "RUNNING" : "idle",
          WiFi.status() == WL_CONNECTED ? "up" : "down",
          aioUp ? "up" : "down");
   }
