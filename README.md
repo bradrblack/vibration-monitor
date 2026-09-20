@@ -1,9 +1,13 @@
-# Pump Sensor
+# Device Monitor via Vibration
 
-Monitors a sump pump by clamping an ADXL345 accelerometer to the discharge pipe
-and detecting the motor's vibration. Runs on an ESP32-C3 and reports pump
-on/off to an Adafruit IO feed named `pump`, and the exact length of each run
-to a feed named `pump-run-seconds`.
+Monitors a device that when operating causes vibration, such as a sump pump, washing machine, 
+AC unit etc. by clamping an ADXL345 accelerometer to the device or in the case of a sump pump, 
+the discharge pipe and detecting the motor's vibration. 
+
+This particular instance was created for a sump pump but the applications are much wider.
+
+Runs on an ESP32-C3 and reports pump on/off to an Adafruit IO feed named `pump`, and the exact 
+length of each run to a feed named `pump-run-seconds`.
 
 ## How it works
 
