@@ -97,6 +97,23 @@ need separate feeds.
 4. The same `secrets.h` (Wi-Fi, Adafruit IO, ntfy topic) works for every device;
    ntfy messages and reboot notices are titled with the device name.
 
+## InfluxDB / Grafana timeline
+
+Telegraf on the InfluxDB host subscribes to the Adafruit IO feed over MQTT and
+writes each event to InfluxDB 2.x as `appliance_state,device=<name>` with fields
+`event`, `running` (1/0) and `seconds` (run length, stop events only), timestamped
+with the event's own `at` time. A new device appears automatically, with no
+Telegraf or dashboard change.
+
+1. Copy `telegraf/appliance-events.conf` to `/etc/telegraf/telegraf.d/` on the host.
+2. Add the variables from `telegraf/appliance-events.env.example` to Telegraf's
+   environment file (use a write-only Influx token) and restart Telegraf.
+3. In Grafana, import `grafana/appliance-monitor.json`, pick the InfluxDB (Flux)
+   data source, and set the `bucket` variable to your bucket name.
+
+Telegraf only sees events while it is running, so events published during an
+outage are not backfilled.
+
 ## Reliability and notifications
 
 This is meant to run unattended, so it borrows the
