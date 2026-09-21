@@ -13,7 +13,7 @@
 #include "secrets.h"
 
 // Bump on each flash you want to identify later -- format: YYYY-MM-DDrN.
-#define FIRMWARE_VERSION "2026-09-21r10"
+#define FIRMWARE_VERSION "2026-09-21r12"
 
 // ---- Per-device configuration ---------------------------------------------
 // One firmware, many devices: each PlatformIO environment (see platformio.ini)
@@ -730,6 +730,7 @@ void checkDailyReboot() {
 // ==========================================
 void setup(void) {
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);  // never block on a stalled USB host; excess output is dropped
   delay(2000);               // give USB-CDC time to attach so early messages aren't lost
   Serial.println();
 
