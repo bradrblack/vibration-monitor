@@ -6,13 +6,14 @@
 #include <time.h>
 #include <cstdarg>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <esp32c3/rom/rtc.h>
 #include <Adafruit_ADXL345_U.h>
 #include "AdafruitIO_WiFi.h"
 #include "secrets.h"
 
 // Bump on each flash you want to identify later -- format: YYYY-MM-DDrN.
-#define FIRMWARE_VERSION "2026-09-20r9"
+#define FIRMWARE_VERSION "2026-09-21r10"
 
 // ---- Per-device configuration ---------------------------------------------
 // One firmware, many devices: each PlatformIO environment (see platformio.ini)
@@ -758,11 +759,24 @@ void setup(void) {
   notifyLastReboot();
   setupSensor();
 
+  // Hardware-backed backstop for a hung loop (stuck I2C/network/USB call): the
+  // software watchdogs above run inside loop() and can't see that. Armed last,
+  // since setup() legitimately blocks for tens of seconds. The longest normal
+  // stall in loop() is a ~1 s ntfy request, so 30 s is generous.
+  esp_task_wdt_config_t wdtCfg = {
+    .timeout_ms = 30000,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  if (esp_task_wdt_reconfigure(&wdtCfg) != ESP_OK) esp_task_wdt_init(&wdtCfg);
+  esp_task_wdt_add(NULL);
+
   logf("Monitoring %s vibration...", DEVICE_NAME);
   nextSampleUs = micros();
 }
 
 void loop(void) {
+  esp_task_wdt_reset();
   // Sample at a fixed rate.
   uint32_t nowUs = micros();
   if ((int32_t)(nowUs - nextSampleUs) < 0) return;
