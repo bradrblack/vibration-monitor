@@ -1,4 +1,5 @@
 <img src="./v-sense.jpg" alt="ESP32 and ADXL345" width="800"/>
+<img src="./grafana.png" alt="Grafana Dashboard" width="800"/>
 
 # Device Monitor via Vibration
 
