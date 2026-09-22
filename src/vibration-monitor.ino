@@ -13,7 +13,7 @@
 #include "secrets.h"
 
 // Bump on each flash you want to identify later -- format: YYYY-MM-DDrN.
-#define FIRMWARE_VERSION "2026-09-21r12"
+#define FIRMWARE_VERSION "2026-09-22r1"
 
 // ---- Per-device configuration ---------------------------------------------
 // One firmware, many devices: each PlatformIO environment (see platformio.ini)
@@ -85,10 +85,14 @@ const float    BASELINE_ALPHA    = 0.2;
 // wraps it in a CSV row, so the message is garbage and Adafruit IO drops it while
 // save() still reports success. Publish through the underlying MQTT client
 // instead, which needs this subclass to reach the protected _mqtt member.
+// _client is also protected -- exposed here so setupWiFi() can shorten its
+// timeout (see there) as a defense against the 30 s hardware watchdog tripping
+// on a stalled network call.
 class AioWiFi : public AdafruitIO_WiFi {
  public:
   using AdafruitIO_WiFi::AdafruitIO_WiFi;
   Adafruit_MQTT *mqtt() { return _mqtt; }
+  WiFiClientSecure *client() { return _client; }
 };
 AioWiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
 // The /feeds/ topic (unlike the /f/ one the library uses) parses a JSON payload.
@@ -110,6 +114,12 @@ const uint32_t WIFI_DOWN_REBOOT_MS     = 120000;  // running: reboot if WiFi dow
 // WiFi can stay associated while Adafruit IO itself is unreachable (DNS/TLS/
 // auth problems), which the WiFi watchdog can't see.
 const uint32_t AIO_DOWN_REBOOT_MS      = 600000;  // 10 min
+// WiFiClientSecure's default socket timeout is 3 s per call, but a stalled
+// connection can chain several calls (DNS, TCP connect, TLS handshake) well
+// past that before giving up. A watchdog reboot (task watchdog, reboot #5) was
+// seen after one such stall; capping the client's own timeout keeps any single
+// serviceNetwork() call safely under the 30 s hardware watchdog in setup().
+const uint32_t AIO_CLIENT_TIMEOUT_MS   = 5000;
 
 // The ADXL345 is polled for its fixed device ID; a wedged or unplugged I2C
 // bus otherwise just produces a stream of zeros (looks like a quiet device).
@@ -584,6 +594,7 @@ void startNetwork() {
 
 // Bounded connect at boot: reboot and retry rather than sit there offline.
 void setupWiFi() {
+  io.client()->setTimeout(AIO_CLIENT_TIMEOUT_MS);
   startNetwork();
   lastWifiAttempt = millis();
   uint32_t start = millis();
